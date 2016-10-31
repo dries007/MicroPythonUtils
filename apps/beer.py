@@ -147,7 +147,6 @@ print('Socket setup...')
 
 
 def socket_handler(listen_s):
-    global settings
     gc.collect()
 
     try:
@@ -184,34 +183,37 @@ def socket_handler(listen_s):
         client.send(ubinascii.b2a_base64(d.digest())[:-1])
         client.send(b'\r\n\r\n')
         ws = websocket.websocket(client)
-        # client.setblocking(False)
-        # client.setsockopt(socket.SOL_SOCKET, 20, socket_handler_inner)
-        gc.collect()
 
-        cmd = ws.readline().strip()
-        if len(cmd) == 0:
-            ws.close()
-            client.close()
-            return
-        elif cmd == b'get':
-            ws.write(json.dumps(settings))
-            ws.write(b'OK\n')
-        elif cmd == b'set':
-            settings = json.loads(ws.readline())
-            ws.write(b'OK\n')
-        elif cmd == b'exec':
-            try:
-                exec(ws.readline())
+        def socket_handler_inner(client):
+            global settings
+            cmd = ws.readline().strip()
+            if len(cmd) == 0:
+                ws.close()
+                client.close()
+                return
+            elif cmd == b'get':
+                ws.write(json.dumps(settings))
                 ws.write(b'OK\n')
-            except Exception as e:
-                print('error', e)
-                ws.write(b'ERROR\n')
-                ws.write(json.dumps(repr(e)))
+            elif cmd == b'set':
+                settings = json.loads(ws.readline())
+                ws.write(b'OK\n')
+            elif cmd == b'exec':
+                try:
+                    exec(ws.readline())
+                    ws.write(b'OK\n')
+                except Exception as e:
+                    print('error', e)
+                    ws.write(b'ERROR\n')
+                    ws.write(json.dumps(repr(e)))
+                    ws.write(b'\n')
+            else:
+                ws.write(b'ERROR\nUnknown action')
+                ws.write(cmd)
                 ws.write(b'\n')
-        else:
-            ws.write(b'ERROR\nUnknown action')
-            ws.write(cmd)
-            ws.write(b'\n')
+
+        client.setblocking(False)
+        client.setsockopt(socket.SOL_SOCKET, 20, socket_handler_inner)
+        gc.collect()
     except Exception as e:
         print('Error handing socket:', e)
 
