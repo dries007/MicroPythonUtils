@@ -1,29 +1,53 @@
 # MICROPYTHON
 
-from boot import *
+import esp
 import machine
+import gc
+import micropython
+import network
 import time
 import ds3231
 import lcdi2c
 import ubinascii
+import sys
 import socket
 import websocket
 import uhashlib
 import json
 
+esp.osdebug(None)
+machine.freq(160000000)
+micropython.alloc_emergency_exception_buf(200)
+
+wlan = network.WLAN(network.STA_IF)
+ap = network.WLAN(network.AP_IF)
+
+SOFT_RESET = const(4)
+SLEEP_RESET = const(5)
+HARD_RESET = const(6)
+
+print()
+print('FLASH ID:    %s' % hex(esp.flash_id()))
+print('WLAN MAC:    %s' % ':'.join('%02X' % b for b in wlan.config("mac")))
+print('AP MAC:      %s' % ':'.join('%02X' % b for b in ap.config("mac")))
+
+gc.collect()
+
+print('Initial setup...')
+
 DAYS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 # Pinouts:
-PIN_SCL = 5
-PIN_SDA = 4
+PIN_SCL = const(5)
+PIN_SDA = const(4)
 
-PIN_HEATING = 12
-PIN_COOLING = 13
+PIN_HEATING = const(12)
+PIN_COOLING = const(13)
 
 # 0 -> 0 = active, 1 -> 0 = inactive
-RELAY_POLARITY = 0
+RELAY_POLARITY = const(0)
 
-PIN_ONEWIRE = 14
+PIN_ONEWIRE = const(14)
 
 settings = {'utc_offset': 3600, 'target': 28.0, 'hyst': 0.25}
 
@@ -37,35 +61,33 @@ rtc = ds3231.DS3231(i2c)
 lcd = lcdi2c.LCD(i2c)
 lcd.init()
 lcd.display_control(True, False, False)
+print('Initialized LCD')
+gc.collect()
 
-
-lcd.print(b'Testing\nHeating')
+print('Testing heating')
+lcd.print(b'Testing Heating')
 heating(RELAY_POLARITY)
 time.sleep(1)
 heating(not RELAY_POLARITY)
 time.sleep(1)
 
-lcd.print(b'Testing\nCooling')
+print('Testing cooling')
+lcd.print(b'Testing Cooling')
 cooling(RELAY_POLARITY)
 time.sleep(1)
 cooling(not RELAY_POLARITY)
 time.sleep(1)
 
-lcd.print(b'Setting up AP')
+print('Starting WiFi')
 
 AP_ESSID = b'Beer' + ubinascii.hexlify(wlan.config("mac"))[8:].upper()
 AP_PASSWD = ubinascii.hexlify(wlan.config("mac"))[:8].upper()
 
+wlan.active(True)
 ap.active(True)
 ap.config(essid=AP_ESSID, password=AP_PASSWD)
-time.sleep(1)
 
-lcd.print(b'Trying WiFi')
-if do_connect():
-    lcd.print(b'WiFi OK')
-else:
-    lcd.print(b'WiFi failed')
-time.sleep(1)
+print('Initial setup done')
 
 
 def lcd_status(line1, line2):
@@ -85,7 +107,7 @@ def lcd_status(line1, line2):
 
 def timer_callback(*args):
     global lcd_count
-
+    gc.collect()
     temp = rtc.temp()
     if 'target' not in settings:
         heating(not RELAY_POLARITY)
@@ -117,26 +139,22 @@ def timer_callback(*args):
         tmp = ds3231.seconds2datetime(ds3231.datetime2seconds(rtc.get_datetime()) + settings['utc_offset'])
         lcd_status(b'%02d:%02d' % (tmp[3], tmp[4]), b'%4d-%02d-%02d' % (tmp[0], tmp[1], tmp[2]))
 
-
 lcd_count = 0
 timer_callback()
 timer.init(period=5000, mode=machine.Timer.PERIODIC, callback=timer_callback)
 
-listen_s = socket.socket()
-listen_s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-listen_s.bind(("0.0.0.0", 80))
-listen_s.listen(1)
+print('Socket setup...')
 
-while True:
-    print(gc.mem_free())
+
+def socket_handler(listen_s):
+    global settings
     gc.collect()
-    print(gc.mem_free())
 
     try:
         client, remote_addr = listen_s.accept()
         if not client.readline() == b'GET / HTTP/1.1\r\n':
             client.close()
-            continue
+            return
 
         ws = None
         ws_key = None
@@ -154,7 +172,7 @@ while True:
             print(v, h)
         if not ws:
             client.close()
-            continue
+            return
         print('Got valid socket connection from', remote_addr)
         d = uhashlib.sha1(ws_key)
         d.update(b'258EAFA5-E914-47DA-95CA-C5AB0DC85B11')
@@ -166,46 +184,41 @@ while True:
         client.send(ubinascii.b2a_base64(d.digest())[:-1])
         client.send(b'\r\n\r\n')
         ws = websocket.websocket(client)
-        while True:
-            cmd = ws.readline().strip()
-            print('cmd', cmd)
-            if len(cmd) == 0:
-                break
-            elif cmd == b'get':
-                ws.write(json.dumps(settings))
+        # client.setblocking(False)
+        # client.setsockopt(socket.SOL_SOCKET, 20, socket_handler_inner)
+        gc.collect()
+
+        cmd = ws.readline().strip()
+        if len(cmd) == 0:
+            ws.close()
+            client.close()
+            return
+        elif cmd == b'get':
+            ws.write(json.dumps(settings))
+            ws.write(b'OK\n')
+        elif cmd == b'set':
+            settings = json.loads(ws.readline())
+            ws.write(b'OK\n')
+        elif cmd == b'exec':
+            try:
+                exec(ws.readline())
                 ws.write(b'OK\n')
-            elif cmd == b'set':
-                settings = json.loads(ws.readline())
-                ws.write(b'OK\n')
-            elif cmd == b'call':
-                try:
-                    split = ws.readline().strip().decode('ascii').split('.')
-                    print('socket call', split)
-                    tmp = globals()[split[0]]
-                    for x in split[1:]:
-                        tmp = getattr(tmp, x)
-                    args = json.loads(ws.readline().strip())
-                    kwargs = json.loads(ws.readline().strip())
-                    print('args', args, 'kwargs', kwargs)
-                    out = tmp(*args, **kwargs)
-                    print('return', out)
-                    ws.write(b'OK\n')
-                    ws.write(json.dumps(out))
-                    ws.write(b'\n')
-                except Exception as e:
-                    print('error', e)
-                    ws.write(b'ERROR\n')
-                    ws.write(json.dumps(repr(e)))
-                    ws.write(b'\n')
-            else:
-                print('Unknown action', cmd)
-                ws.write(b'ERROR\nUnknown action')
-                ws.write(cmd)
+            except Exception as e:
+                print('error', e)
+                ws.write(b'ERROR\n')
+                ws.write(json.dumps(repr(e)))
                 ws.write(b'\n')
-        ws.close()
-        client.close()
+        else:
+            ws.write(b'ERROR\nUnknown action')
+            ws.write(cmd)
+            ws.write(b'\n')
     except Exception as e:
         print('Error handing socket:', e)
 
-# Hard reset
-machine.Pin(16, machine.Pin.OUT)(0)
+listen_s = socket.socket()
+listen_s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+listen_s.bind(("0.0.0.0", 80))
+listen_s.listen(1)
+listen_s.setsockopt(socket.SOL_SOCKET, 20, socket_handler)
+
+print('Socket setup done.')
